@@ -9,7 +9,7 @@
 #define MNIST_DOUBLE 
 #include<stdio.h>
 #include "mnist.h"
-#include "matrix.h"
+#include "tensor.h"
 #include "time.h"
 #define INPUT_SIZE 28
 
@@ -22,49 +22,84 @@ void read_mnist_data(){
 	mnist_load("data/t10k-images.idx3-ubyte", "data/t10k-labels.idx1-ubyte",
 			&test_data_set, &test_data_count);
 }
-void rand_init_arr(float *arr, int arr_size){
-	for (int i = 0; i < arr_size; i++){
-		srand(i);		
-		arr[i] = (rand() % 100) / 100.0;
-		printf("%f ", arr[i]);
-		//arr[i] = 0.0; 
-	}
-}
+
 
 static int minst_size = 28;
 static int input_size = 32;
-matrix d_input_matrix;
-matrix h_input_matrix;
 
 static int c1_kernel_size = 5;
-static int c1_channel_size = 3;
+static int c1_parallel_channel_size = 6;
+static int c1_relate_channel_size = 1;
 static int c1_size = input_size - c1_kernel_size + 1;
-matrix d_c1_kernel_matrix;
-matrix d_c1_bias_matrix;
-matrix h_c1_kernel_matrix;
+// include bias in kernel tensor
+tensor d_input_image;
+tensor h_input_image;
+
+//c1
+tensor d_input_tensor;
+tensor d_c1_kernel_tensor;
+tensor d_c1;
+
+//s2
+tensor d_s2_channel_weight;
+tensor d_s2_channel_bias;
+int s2_window_size = 2; 
+tensor d_s2;
 
 void init_all(){
 	read_mnist_data();
 	
-	int input_matrix_rows = c1_kernel_size * c1_kernel_size;
-	int input_matrix_cols = c1_size * c1_size;
-	alloc_matrix_host(&h_input_matrix, input_matrix_rows, input_matrix_cols);
-	alloc_matrix_device(&d_input_matrix, input_matrix_rows, input_matrix_cols);
+	// 1 is the size of bias
+	int input_tensor_rows = c1_kernel_size * c1_kernel_size * c1_relate_channel_size + (1 * c1_relate_channel_size);
+	int input_tensor_cols = c1_size * c1_size;
+	alloc_tensor_device(&d_input_tensor, input_tensor_rows, input_tensor_cols);
 
-	// init c1 kernel
-	int c1_kernel_matrix_col = c1_kernel_size * c1_kernel_size;
-	alloc_matrix_host(&h_c1_kernel_matrix, c1_channel_size, c1_kernel_matrix_col);
-	rand_init_arr(h_c1_kernel_matrix.data, c1_channel_size * c1_kernel_matrix_col);
-	alloc_matrix_device(&d_c1_kernel_matrix, c1_channel_size, c1_kernel_matrix_col);
-	size_t bytes_c1_kernel_matrix = sizeof(float) * c1_channel_size * c1_kernel_matrix_col;
-	cudaMemcpy(d_c1_kernel_matrix.data, h_c1_kernel_matrix.data, bytes_c1_kernel_matrix, cudaMemcpyHostToDevice);
-	//free_matrix_host(&h_c1_kernel_matrix);
+	alloc_tensor_host(&h_input_image, input_size, input_size);
+	alloc_tensor_device(&d_input_image, input_size, input_size);
+
+
+	// init c1
+	tensor h_c1_kernel_tensor;
+	int c1_kernel_tensor_col = c1_kernel_size * c1_kernel_size * c1_relate_channel_size + (1 * c1_relate_channel_size);
+	alloc_tensor_host(&h_c1_kernel_tensor, c1_parallel_channel_size, c1_kernel_tensor_col);
+	rand_init_tensor(&h_c1_kernel_tensor);
+	alloc_tensor_device(&d_c1_kernel_tensor, c1_parallel_channel_size, c1_kernel_tensor_col);
+	tensor_memcpy_h2d(&d_c1_kernel_tensor, &h_c1_kernel_tensor);
+	free_tensor_host(&h_c1_kernel_tensor);
+	alloc_tensor_device(&d_c1, c1_size, c1_size, c1_parallel_channel_size);
+	
+	// init s2
+	tensor h_s2_channel_weight;
+	tensor h_s2_channel_bias;
+	alloc_tensor_host(&h_s2_channel_weight, c1_parallel_channel_size * c1_relate_channel_size, 1);
+	alloc_tensor_host(&h_s2_channel_bias, c1_parallel_channel_size * c1_relate_channel_size, 1);
+	rand_init_tensor(&h_s2_channel_weight);
+	rand_init_tensor(&h_s2_channel_bias);
+
+	alloc_tensor_device(&d_s2_channel_weight, c1_parallel_channel_size * c1_relate_channel_size, 1);
+	alloc_tensor_device(&d_s2_channel_bias, c1_parallel_channel_size * c1_relate_channel_size, 1);
+	tensor_memcpy_h2d(&d_s2_channel_weight, &h_s2_channel_weight);
+	tensor_memcpy_h2d(&d_s2_channel_bias, &h_s2_channel_bias);
+	free_tensor_host(&h_s2_channel_weight);
+	free_tensor_host(&h_s2_channel_bias);
+	
+	if (d_c1.rows % s2_window_size != 0 || d_c1.cols % s2_window_size != 0){
+		printf("Error! can not sampling in line: %d of file: %d\n", __LINE__, __FILE__);
+		exit(0);
+	}
+	alloc_tensor_device(&d_s2, d_c1.rows / s2_window_size, d_c1.cols / s2_window_size, d_c1.height);
 }
 
 void free_all(){
-	free_matrix_device(&d_input_matrix);
-	free_matrix_device(&d_c1_kernel_matrix);
+	free_tensor_device(&d_input_image);
+	free_tensor_host(&h_input_image);
 
+	free_tensor_device(&d_input_tensor);
+	free_tensor_device(&d_c1_kernel_tensor);
+	free_tensor_device(&d_c1);
+
+	free_tensor_device(&d_s2_channel_weight);
+	free_tensor_device(&d_s2_channel_bias);
 }
 
 void print_input_image(const mnist_data *out){
@@ -79,49 +114,22 @@ void print_input_image(const mnist_data *out){
 
 
 void forward_prop(mnist_data *input){
-	// c1
-	float *tmp_in = (float *)malloc(input_size * input_size * sizeof(float));
-	memset(tmp_in, 0x00, input_size * input_size * sizeof(float));
 	for (int i = 0; i < minst_size; i++){
 		for (int j = 0; j < minst_size; j++){
-			tmp_in[(i + 2) * input_size + j + 2] = input->data[i][j];
+			h_input_image.data[(i + 2) * input_size + j + 2] = input->data[i][j];
 		}
 	}
+	tensor_memcpy_h2d(&d_input_image, &h_input_image);
 
-	// unrolling input image in host
-	int unrolling_size = input_size - c1_kernel_size + 1;
-	for (int i = 0; i < unrolling_size; i++){
-		for (int j = 0; j < unrolling_size; j++){
-			for (int x = 0; x< c1_kernel_size; x++){
-				for (int y = 0; y < c1_kernel_size; y++){
-					h_input_matrix.data[(x * c1_kernel_size + y) * h_input_matrix.cols + i * unrolling_size + j] = tmp_in[(i+x) * input_size + j + y];	
-				}
-			}
-		}
-	}
-	size_t bytes_input_matrix = sizeof(float) * d_input_matrix.rows * d_input_matrix.cols;
-	cudaMemcpy(d_input_matrix.data, h_input_matrix.data, bytes_input_matrix, cudaMemcpyHostToDevice);
-
-	//matrix h_c1;
-	//alloc_matrix_host(&h_c1, h_c1_kernel_matrix.rows, h_input_matrix.cols);
-	//matrix_dot_host(&h_c1_kernel_matrix, &h_input_matrix, &h_c1);
-	//reshap_matrix(&h_c1, 30, 30);
-	//print_matrix(&h_c1);
-
-	matrix d_c1;
-	alloc_matrix_device(&d_c1, h_c1_kernel_matrix.rows, h_input_matrix.cols);
-	matrix_dot_device(&d_c1_kernel_matrix, &d_input_matrix, &d_c1);
-
-	matrix h_c2;
-	alloc_matrix_host(&h_c2, h_c1_kernel_matrix.rows, h_input_matrix.cols);
-	cudaMemcpy(h_c2.data, d_c1.data, sizeof(float) * h_c2.rows*h_c2.cols, cudaMemcpyDeviceToHost);
-	reshap_matrix(&h_c2, 28 * 3, 28);
-	print_matrix(&h_c2);
-	//if(!is_same_matrix(&h_c1, &h_c2)){
-	//	exit(0);
-	//}
-
-	free(tmp_in);
+	// c1
+	// unrolling input image in device 
+	unrolling_conv_tensor_device(c1_kernel_size, &d_input_image, &d_input_tensor);
+	tensor_dot_device(&d_c1_kernel_tensor, &d_input_tensor, &d_c1);
+	print_tensor_device(&d_c1);
+	
+	// s2
+	sampling_device(&d_c1, &d_s2_channel_weight, &d_s2_channel_bias, &d_s2, s2_window_size);
+	print_tensor_device(&d_s2);
 }
 
 void learn(){
@@ -138,5 +146,6 @@ int main(){
 	learn();
 	//test();
 	free_all();
+	printf("End\n");
 	return 0;
 }
