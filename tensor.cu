@@ -149,32 +149,37 @@ void unrolling_conv_tensor_host(int kernel_size, tensor *h_in, tensor *h_rets){
 	}
 }
 
-__global__ void unrolling_conv_tensor_kernel (float *d_in, int in_cols, float *d_rets, int rets_cols, int kernel_size, int unrolling_size_rows, int unrolling_size_cols){
+__global__ void unrolling_conv_tensor_kernel (float *d_in, int in_rows, int in_cols, float *d_rets, int rets_cols, int kernel_size, int unrolling_size_rows, int unrolling_size_cols){
 	int row = blockDim.y * blockIdx.y + threadIdx.y;
 	int col = blockDim.x * blockIdx.x + threadIdx.x;
 	if (row >= unrolling_size_rows || col >= unrolling_size_cols){
 		return ;
 	}
+	int in_height = row / in_rows;
 	// unroling one convolution
 	for (int x = 0; x< kernel_size; x++){
 		for (int y = 0; y < kernel_size; y++){
-			d_rets[(x * kernel_size + y) * rets_cols + row * unrolling_size_cols + col] = d_in[(row+x) * in_cols + col + y];	
+			// int out_size_row = (in_height * (kernel_size * kernel_size + 1) + x * kernel_size + y); 
+			// int out_size_col = (row % in_rows) * unrolling_size_cols + col; 
+			d_rets[(in_height * (kernel_size * kernel_size + 1) + x * kernel_size + y) * rets_cols + (row % in_rows) * unrolling_size_cols + col] = d_in[(row+x) * in_cols + col + y];	
 		}
 	}
 	// bias 
-	d_rets[(kernel_size * kernel_size) * rets_cols + row * unrolling_size_cols + col] = 1.0;	
+	//d_rets[(in_height * (kernel_size * kernel_size + 1) + kernel_size * kernel_size) * rets_cols + (row % in_rows) * unrolling_size_cols + col] = 0.0;	
+	d_rets[(in_height * (kernel_size * kernel_size + 1) + kernel_size * kernel_size) * rets_cols + (row % in_rows) * unrolling_size_cols + col] = 1.0;	
 }
 
 void unrolling_conv_tensor_device(int kernel_size, tensor *d_in, tensor *d_rets){
-	int unrolling_size_rows = d_in->rows - kernel_size + 1;
+	int unrolling_size_rows = d_in->height * (d_in->rows - kernel_size + 1);
 	int unrolling_size_cols = d_in->cols - kernel_size + 1;
 
+	int in_rows = d_in->rows - kernel_size + 1;
 	dim3 blocks(TILE, TILE);
 	int block_x = (unrolling_size_cols + TILE - 1) / TILE;
 	int block_y = (unrolling_size_rows + TILE - 1) / TILE;
 	dim3 grids(block_x, block_y);
 	printf("grid x: %d, y: %d\n", block_x, block_y);
-	unrolling_conv_tensor_kernel<<<grids, blocks>>>(d_in->data, d_in->cols, d_rets->data, d_rets->cols, kernel_size, unrolling_size_rows, unrolling_size_cols);
+	unrolling_conv_tensor_kernel<<<grids, blocks>>>(d_in->data, in_rows, d_in->cols, d_rets->data, d_rets->cols, kernel_size, unrolling_size_rows, unrolling_size_cols);
 }
 
 __global__ void tensor_dot_device_kernel_reg(float *d_A, int rows_A, int cols_A, float *d_B, int cols_B, float *d_C){
@@ -280,8 +285,10 @@ __global__ void sampling_device_kernel(float *d_c, float *d_channel_weight, floa
 			rets += d_c[i * c_cols + j]; 
 		}
 	}
-	rets = rets * d_channel_weight[channel_id] + d_channel_bias[channel_id];
-	d_s[row * cols + col] = tanh_device(rets);
+	// zhaopeng debug
+	//rets = rets * d_channel_weight[channel_id];
+	//d_s[row * cols + col] = rets;
+	rets = tanh_device(rets * d_channel_weight[channel_id] + d_channel_bias[channel_id]);
 }
 void sampling_device(tensor *d_c, tensor *d_channel_weight, tensor *d_channel_bias, tensor *d_s2, int window_size)
 {
@@ -295,4 +302,70 @@ void sampling_device(tensor *d_c, tensor *d_channel_weight, tensor *d_channel_bi
 	dim3 grids(block_x, block_y);
 	printf("grid x: %d, y: %d\n", block_x, block_y);
 	sampling_device_kernel<<<grids, blocks>>>(d_c->data, d_channel_weight->data, d_channel_bias->data, d_s2->data, d_c->cols, sum_rows, cols, rows, window_size);
+}
+
+void unrolling_conv_kernel_host(tensor *h_kernel_tensor,  int kernel_size, const bool *connect, tensor *h_kernel_matrix)
+{
+	for (int i = 0; i < h_kernel_matrix->rows; i++){
+		for (int j = 0; j < h_kernel_tensor->height; j++){
+			int c_idx = i * h_kernel_tensor->height + j;
+			if (connect[c_idx]){
+				int start_idx = i * h_kernel_matrix->cols + j * h_kernel_tensor->cols;
+				for (int k = 0; k < h_kernel_tensor->cols; k++){
+					h_kernel_matrix->data[start_idx++] = h_kernel_tensor->data[j * h_kernel_tensor->cols + k];
+				}
+			}
+		}
+	}
+}
+
+__global__ void tensor_dot_device_kernel_bias_reg(float *d_A, int rows_A, int cols_A, float *d_B, int cols_B, float *d_C, float *d_bias){
+
+	int row = blockDim.y * blockIdx.y + threadIdx.y;
+	int col = blockDim.x * blockIdx.x + threadIdx.x;
+	__shared__ float shmm_B[TILE][TILE];
+	int n_proc = (cols_A + TILE - 1) / TILE;
+	int tx = threadIdx.x;
+	int ty = threadIdx.y;
+	float tmp = 0.0;
+	for (int i = 0; i < n_proc; i++){
+		// replace shared memory using register file
+		float reg_A = 0.0;
+		if (row < rows_A)
+			reg_A = d_A[row * cols_A + i * TILE + tx];
+		if (col < cols_B)
+			shmm_B[ty][tx] = d_B[(i * TILE + ty) * cols_B + col];
+		else
+			shmm_B[ty][tx] = 0;
+		__syncthreads();
+
+		for (int j = 0; j < TILE; j++){
+			tmp += reg_A * shmm_B[(tx + j) % TILE][tx];
+			reg_A = __shfl(reg_A, tx + 1, TILE);
+		}
+		__syncthreads();
+	}
+	if (row < rows_A && col < cols_B)
+		d_C[row * cols_B + col] = tmp + d_bias[row];
+}
+
+void tensor_dot_device_bias(tensor *d_A, tensor *d_bias, tensor *d_B, tensor *d_rets)
+{
+	int rows_A = d_A->rows;
+	int cols_A = d_A->cols;
+	int rows_B = d_B->rows;
+	int cols_B = d_B->cols;
+	int rows_bias = d_bias->rows;
+	if (cols_A != rows_B || rows_bias != rows_A){
+		printf("error in %d %s!\n", __LINE__, __FILE__);
+		exit(0);
+	}
+
+	dim3 blocks(TILE, TILE);
+	int block_x = (cols_B + TILE - 1) / TILE;
+	int block_y = (rows_A + TILE - 1) / TILE;
+	dim3 grids(block_x, block_y);
+	printf("grid x: %d, y: %d\n", block_x, block_y);
+
+	tensor_dot_device_kernel_bias_reg<<<grids, blocks>>>(d_A->data, rows_A, cols_A, d_B->data, cols_B, d_rets->data, d_bias->data);
 }

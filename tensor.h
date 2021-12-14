@@ -54,4 +54,8 @@ void tensor_dot_device(tensor *h_A, tensor *h_B, tensor *h_rets);
 
 void sampling_device(tensor *d_c1, tensor *d_channel_weight, tensor *d_channel_bias, tensor *d_s2, int window_size);
 
+void unrolling_conv_kernel_host(tensor *h_kernel_tensor,  int kernel_size, const bool *connect, tensor *h_kernel_matrix);
+
+void tensor_dot_device_bias(tensor *d_A, tensor *d_bias, tensor *d_B, tensor *d_rets);
+
 #endif
