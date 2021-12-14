@@ -1,2 +1,2 @@
 # leNet_5_gpu
-LeNet-5网络推理过程
+gpu版本的LeNet-5推理过程
